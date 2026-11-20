@@ -110,9 +110,9 @@ foreach ($line in $vars) {
     }
 }
 if ($env:VSCMD_ARG_TGT_ARCH -ne 'x64' -or -not $env:WindowsSDKVersion) { throw 'Wrong MSVC target or SDK' }
-$cl = (Get-Command cl.exe -CommandType Application).Source
-$nmake = (Get-Command nmake.exe -CommandType Application).Source
-$dumpbin = (Get-Command dumpbin.exe -CommandType Application).Source
+$cl = (Get-Command cl.exe -CommandType Application -TotalCount 1).Source
+$nmake = (Get-Command nmake.exe -CommandType Application -TotalCount 1).Source
+$dumpbin = (Get-Command dumpbin.exe -CommandType Application -TotalCount 1).Source
 $probe = "$root\probe.c"
 Set-Content -LiteralPath $probe -Value 'int main(void) { return 0; }' -Encoding ascii
 $compilerBanner = @(Run $cl @('/nologo','/Bv','/c',$probe,"/Fo$root\probe.obj"))
@@ -121,7 +121,7 @@ $toolchain = [ordered]@{
     VSInstallationVersion=$vs[0].installationVersion; VSProduct=$vs[0].displayName
     MSVC=(Get-Item -LiteralPath $cl).VersionInfo.FileVersion; VCTools=$env:VCToolsVersion
     WindowsSDK=$env:WindowsSDKVersion.TrimEnd('\'); NMake=(Get-Item -LiteralPath $nmake).VersionInfo.FileVersion
-    Target=$env:VSCMD_ARG_TGT_ARCH; CompilerBanner=$compilerBanner
+    Target=$env:VSCMD_ARG_TGT_ARCH; CompilerBanner=@($compilerBanner | ForEach-Object { [string]$_ })
 }
 $toolchain | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath "$evidence\toolchain.json" -Encoding utf8
 $libHeaders = @(& $dumpbin /headers "$pg\lib\postgres.lib" | Select-String -Pattern '(?i)8664|machine.*(x86|ARM64)' | ForEach-Object Line | Sort-Object -Unique)
@@ -132,7 +132,7 @@ $libHeaders | Set-Content -LiteralPath "$evidence\postgres-lib-architecture.txt"
 
 $src = "$root\upstream"
 [void][IO.Directory]::CreateDirectory($src)
-$git = (Get-Command git.exe -CommandType Application).Source
+$git = (Get-Command git.exe -CommandType Application -TotalCount 1).Source
 $env:GIT_TERMINAL_PROMPT = '0'
 $null = Run $git @('-C',$src,'init')
 $null = Run $git @('-C',$src,'-c','credential.helper=','fetch','--no-tags','--depth=1',
