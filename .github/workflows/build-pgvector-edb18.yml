@@ -1,0 +1,33 @@
+name: Build pgvector 0.8.7 for EDB PostgreSQL 18.7 x64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pgvector-edb18-win2022
+  cancel-in-progress: false
+
+jobs:
+  build-and-test:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out public build and test files
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Verify inputs, build with VS 2022, test, and restore
+        run: ./Invoke-VectorLab.ps1
+      - name: Upload verified extension and evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pgvector-0.8.7-edb18.7-win-x64
+          path: ${{ runner.temp }}/edb18-vector-build/upload/
+          if-no-files-found: error
+          retention-days: 7
