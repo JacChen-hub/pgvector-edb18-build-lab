@@ -23,11 +23,25 @@ jobs:
         with:
           persist-credentials: false
       - name: Verify inputs, build with VS 2022, test, and restore
-        run: ./Invoke-VectorLab.ps1
-      - name: Upload verified extension and evidence
+        timeout-minutes: 40
+        run: ./Invoke-VectorLab.ps1 -Phase Core
+      - name: Upload extension and core test evidence
+        id: core_upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: pgvector-0.8.7-edb18.7-win-x64
           path: ${{ runner.temp }}/edb18-vector-build/upload/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Run the 14 upstream regression cases
+        id: regression
+        timeout-minutes: 15
+        run: ./Invoke-VectorLab.ps1 -Phase Regression
+      - name: Upload upstream regression evidence
+        if: ${{ !cancelled() && steps.core_upload.outcome == 'success' && steps.regression.outcome != 'skipped' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pgvector-0.8.7-edb18.7-win-x64-regression-evidence
+          path: ${{ runner.temp }}/edb18-vector-build/regression-evidence/
           if-no-files-found: error
           retention-days: 7
