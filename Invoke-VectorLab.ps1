@@ -1,3 +1,6 @@
+[CmdletBinding()]
+param([ValidateSet('Core','Regression')][string]$Phase = 'Core')
+
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64' -or -not $env:GITHUB_RUN_ID) {
@@ -5,10 +8,17 @@ if ($env:RUNNER_OS -ne 'Windows' -or $env:RUNNER_ARCH -ne 'X64' -or -not $env:GI
 }
 
 $root = Join-Path $env:RUNNER_TEMP 'edb18-vector-build'
-$evidence = "$root\evidence"
-if (Test-Path -LiteralPath $root) { throw 'Runner workspace must be fresh' }
+$src = "$root\upstream"
+$pg = "$root\edb\pgsql"
+$regressExe = "$pg\lib\pgxs\src\test\regress\pg_regress.exe"
+$evidence = if ($Phase -eq 'Core') { "$root\evidence" } else { "$root\regression-evidence" }
+$secretDir = "$root\credentials-$Phase"
+$upload = "$root\upload"
+if ($Phase -eq 'Core' -and (Test-Path -LiteralPath $root)) { throw 'Runner workspace must be fresh' }
+if ($Phase -eq 'Regression' -and (-not (Test-Path -LiteralPath "$upload\build-manifest.json" -PathType Leaf) -or
+        (Test-Path -LiteralPath $evidence))) { throw 'Regression requires a completed core phase and fresh evidence directory' }
 [void][IO.Directory]::CreateDirectory($evidence)
-$log = "$evidence\build-and-test.log"
+$log = if ($Phase -eq 'Core') { "$evidence\build-and-test.log" } else { "$evidence\regression.log" }
 $name = 'postgresql-18.7-1-windows-x64-binaries.zip'
 $url = "https://get.enterprisedb.com/postgresql/$name"
 $expected = 'ead0bbc27fb678fa24dcf86b738981323042abd073c744103bf7f3aed23f9a33'
@@ -49,133 +59,136 @@ function Assert-X64([string]$Path) {
     } finally { $file.Dispose() }
 }
 
-$curl = "$env:SystemRoot\System32\curl.exe"
-$transfer = @('-q','--proto','=https','--proto-redir','=https','-fsSL','--connect-timeout','30','--retry','2')
-$null = Run $curl ($transfer + @('--max-time','60','-o',"$evidence\$name.sha256","$url.sha256"))
-$official = (Get-Content -Raw -LiteralPath "$evidence\$name.sha256").Trim()
-if ($official -cnotmatch '^([a-z0-9]{64})\s+\*?(.+)$' -or $Matches[1] -cne $expected -or $Matches[2] -cne $name) {
-    throw 'Fresh EDB sidecar mismatch'
-}
-$archive = "$root\$name"
-$null = Run $curl ($transfer + @('--max-time','900','-o',$archive,$url))
-if ((Get-Item -LiteralPath $archive).Length -ne 389515503 -or (Hash $archive) -cne $expected) {
-    throw 'EDB ZIP size or SHA-256 mismatch'
-}
-$zip = [IO.Compression.ZipFile]::OpenRead($archive)
-try {
-    $match = @($zip.Entries | Where-Object FullName -cmatch '^(?:[^/]+/)*bin/postgres\.exe$')
-    if ($match.Count -ne 1) { throw 'Could not uniquely determine EDB archive root' }
-    $prefix = $match[0].FullName -creplace 'bin/postgres\.exe$',''
-} finally { $zip.Dispose() }
-$dest = "$root\edb"
-[void][IO.Directory]::CreateDirectory($dest)
-$tree = @('bin','lib','share','include') | ForEach-Object { $prefix + $_ }
-$null = Run "$env:SystemRoot\System32\tar.exe" (@('-xf',$archive,'-C',$dest) + $tree)
-$pg = if ($prefix) { Join-Path $dest $prefix.TrimEnd('/') } else { $dest }
-$keyFiles = @('bin/postgres.exe','bin/pg_config.exe','bin/initdb.exe','bin/pg_ctl.exe',
-    'lib/postgres.lib','include/server/postgres.h','include/server/pg_config.h')
-$regressExe = "$pg\lib\pgxs\src\test\regress\pg_regress.exe"
-if (Test-Path -LiteralPath $regressExe -PathType Leaf) { $keyFiles += 'lib/pgxs/src/test/regress/pg_regress.exe' }
-if (-not (Test-Path -LiteralPath "$pg\share\extension" -PathType Container)) { throw 'EDB extension directory missing' }
-foreach ($f in $keyFiles) {
-    if (-not (Test-Path -LiteralPath (Join-Path $pg $f) -PathType Leaf)) { throw "EDB file missing: $f" }
-    if ($f.EndsWith('.exe')) { Assert-X64 (Join-Path $pg $f) }
-}
-$version = @(Run "$pg\bin\postgres.exe" @('--version'))
-$pgConfig = @(Run "$pg\bin\pg_config.exe" @('--version'))
-if (($version -join '') -cne 'postgres (PostgreSQL) 18.7' -or ($pgConfig -join '') -cne 'PostgreSQL 18.7') {
-    throw 'Wrong EDB version'
-}
-$headers = @(Get-ChildItem -LiteralPath "$pg\include\server" -Recurse -File | ForEach-Object {
-    [IO.Path]::GetRelativePath($pg,$_.FullName).Replace('\','/')
-})
-$baseline = foreach ($f in (($keyFiles+$headers) | Sort-Object -Unique)) {
-    [pscustomobject]@{Path=$f; SHA256=(Hash (Join-Path $pg $f))}
-}
-$baseline | Export-Csv -NoTypeInformation -LiteralPath "$evidence\edb-files.csv" -Encoding utf8
-Note "Verified EDB $expected with $($baseline.Count) hashed baseline files"
-
-$x86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
-$vswhere = "$x86\Microsoft Visual Studio\Installer\vswhere.exe"
-$vsJson = @(Run $vswhere @('-products','*','-version','[17.0,18.0)','-requires',
-    'Microsoft.VisualStudio.Component.VC.Tools.x86.x64','-latest','-format','json'))
-$vs = @(($vsJson -join [Environment]::NewLine) | ConvertFrom-Json)
-if ($vs.Count -ne 1 -or -not $vs[0].installationPath) { throw 'VS 2022 C++ x64 required' }
-$batch = Join-Path $vs[0].installationPath 'VC\Auxiliary\Build\vcvars64.bat'
-$vars = @(& $env:ComSpec /d /c ('call "{0}" >nul && set' -f $batch))
-if ($LASTEXITCODE -ne 0) { throw 'vcvars64 failed' }
-foreach ($line in $vars) {
-    if ($line -match '^(Path|INCLUDE|LIB|LIBPATH|WindowsSDKVersion|WindowsSdkDir|UniversalCRTSdkDir|UCRTVersion|VCINSTALLDIR|VCToolsInstallDir|VCToolsVersion|VisualStudioVersion|VSCMD_ARG_TGT_ARCH|VSCMD_ARG_HOST_ARCH)=(.*)$') {
-        [Environment]::SetEnvironmentVariable($Matches[1],$Matches[2],'Process')
+function Build-Extension {
+    $curl = "$env:SystemRoot\System32\curl.exe"
+    $transfer = @('-q','--proto','=https','--proto-redir','=https','-fsSL','--connect-timeout','30','--retry','2')
+    $null = Run $curl ($transfer + @('--max-time','60','-o',"$evidence\$name.sha256","$url.sha256"))
+    $official = (Get-Content -Raw -LiteralPath "$evidence\$name.sha256").Trim()
+    if ($official -cnotmatch '^([a-z0-9]{64})\s+\*?(.+)$' -or $Matches[1] -cne $expected -or $Matches[2] -cne $name) {
+        throw 'Fresh EDB sidecar mismatch'
     }
-}
-if ($env:VSCMD_ARG_TGT_ARCH -ne 'x64' -or -not $env:WindowsSDKVersion) { throw 'Wrong MSVC target or SDK' }
-$cl = (Get-Command cl.exe -CommandType Application -TotalCount 1).Source
-$nmake = (Get-Command nmake.exe -CommandType Application -TotalCount 1).Source
-$dumpbin = (Get-Command dumpbin.exe -CommandType Application -TotalCount 1).Source
-$probe = "$root\probe.c"
-Set-Content -LiteralPath $probe -Value 'int main(void) { return 0; }' -Encoding ascii
-$compilerBanner = @(Run $cl @('/nologo','/Bv','/c',$probe,"/Fo$root\probe.obj"))
-$null = Run $nmake @('/?')
-$toolchain = [ordered]@{
-    VSInstallationVersion=$vs[0].installationVersion; VSProduct=$vs[0].displayName
-    MSVC=(Get-Item -LiteralPath $cl).VersionInfo.FileVersion; VCTools=$env:VCToolsVersion
-    WindowsSDK=$env:WindowsSDKVersion.TrimEnd('\'); NMake=(Get-Item -LiteralPath $nmake).VersionInfo.FileVersion
-    Target=$env:VSCMD_ARG_TGT_ARCH; CompilerBanner=@($compilerBanner | ForEach-Object { [string]$_ })
-}
-$toolchain | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath "$evidence\toolchain.json" -Encoding utf8
-$libHeaders = @(& $dumpbin /headers "$pg\lib\postgres.lib" | Select-String -Pattern '(?i)8664|machine.*(x86|ARM64)' | ForEach-Object Line | Sort-Object -Unique)
-if ($LASTEXITCODE -ne 0 -or -not ($libHeaders -match '(?i)8664') -or ($libHeaders -match '(?i)machine.*\((x86|ARM64)\)')) {
-    throw 'EDB postgres.lib does not match x64'
-}
-$libHeaders | Set-Content -LiteralPath "$evidence\postgres-lib-architecture.txt" -Encoding utf8
-
-$src = "$root\upstream"
-[void][IO.Directory]::CreateDirectory($src)
-$git = (Get-Command git.exe -CommandType Application -TotalCount 1).Source
-$env:GIT_TERMINAL_PROMPT = '0'
-$null = Run $git @('-C',$src,'init')
-$null = Run $git @('-C',$src,'-c','credential.helper=','fetch','--no-tags','--depth=1',
-    'https://github.com/pgvector/pgvector.git',$commit)
-$null = Run $git @('-C',$src,'checkout','--detach','FETCH_HEAD')
-$head = @(Run $git @('-C',$src,'rev-parse','HEAD'))
-$dirty = @(Run $git @('-C',$src,'status','--porcelain'))
-if (($head -join '') -cne $commit -or $dirty.Count -or
-    -not (Select-String -LiteralPath "$src\Makefile.win" -Pattern '^EXTVERSION\s*=\s*0\.8\.7\s*$') -or
-    -not (Select-String -LiteralPath "$src\vector.control" -Pattern "^default_version\s*=\s*'0\.8\.7'\s*$")) {
-    throw 'Pinned source or version verification failed'
-}
-$env:PGROOT = $pg
-Push-Location -LiteralPath $src
-try {
-    $null = Run $nmake @('/NOLOGO','/F','Makefile.win')
-    foreach ($f in @('vector.dll','vector.lib','vector.exp','sql\vector--0.8.7.sql')) {
-        if (-not (Test-Path -LiteralPath "$src\$f" -PathType Leaf)) { throw "Missing output: $f" }
+    $archive = "$root\$name"
+    $null = Run $curl ($transfer + @('--max-time','900','-o',$archive,$url))
+    if ((Get-Item -LiteralPath $archive).Length -ne 389515503 -or (Hash $archive) -cne $expected) {
+        throw 'EDB ZIP size or SHA-256 mismatch'
     }
-    Assert-X64 "$src\vector.dll"
-    $null = Run $nmake @('/NOLOGO','/F','Makefile.win','install')
-} finally { Pop-Location }
-if ((Hash "$src\vector.dll") -cne (Hash "$pg\lib\vector.dll")) { throw 'Installed DLL differs from build' }
-$null = Run $dumpbin @('/dependents',"$pg\lib\vector.dll")
+    $zip = [IO.Compression.ZipFile]::OpenRead($archive)
+    try {
+        $match = @($zip.Entries | Where-Object FullName -cmatch '^(?:[^/]+/)*bin/postgres\.exe$')
+        if ($match.Count -ne 1 -or $match[0].FullName -cne 'pgsql/bin/postgres.exe') {
+            throw 'Unexpected layout in the pinned EDB archive'
+        }
+        $prefix = $match[0].FullName -creplace 'bin/postgres\.exe$',''
+    } finally { $zip.Dispose() }
+    $dest = "$root\edb"
+    [void][IO.Directory]::CreateDirectory($dest)
+    $tree = @('bin','lib','share','include') | ForEach-Object { $prefix + $_ }
+    $null = Run "$env:SystemRoot\System32\tar.exe" (@('-xf',$archive,'-C',$dest) + $tree)
+    $keyFiles = @('bin/postgres.exe','bin/pg_config.exe','bin/initdb.exe','bin/pg_ctl.exe',
+        'lib/postgres.lib','include/server/postgres.h','include/server/pg_config.h')
+    if (Test-Path -LiteralPath $regressExe -PathType Leaf) { $keyFiles += 'lib/pgxs/src/test/regress/pg_regress.exe' }
+    if (-not (Test-Path -LiteralPath "$pg\share\extension" -PathType Container)) { throw 'EDB extension directory missing' }
+    foreach ($f in $keyFiles) {
+        if (-not (Test-Path -LiteralPath (Join-Path $pg $f) -PathType Leaf)) { throw "EDB file missing: $f" }
+        if ($f.EndsWith('.exe')) { Assert-X64 (Join-Path $pg $f) }
+    }
+    $version = @(Run "$pg\bin\postgres.exe" @('--version'))
+    $pgConfig = @(Run "$pg\bin\pg_config.exe" @('--version'))
+    if (($version -join '') -cne 'postgres (PostgreSQL) 18.7' -or ($pgConfig -join '') -cne 'PostgreSQL 18.7') {
+        throw 'Wrong EDB version'
+    }
+    $headers = @(Get-ChildItem -LiteralPath "$pg\include\server" -Recurse -File | ForEach-Object {
+        [IO.Path]::GetRelativePath($pg,$_.FullName).Replace('\','/')
+    })
+    $baseline = foreach ($f in (($keyFiles+$headers) | Sort-Object -Unique)) {
+        [pscustomobject]@{Path=$f; SHA256=(Hash (Join-Path $pg $f))}
+    }
+    $baseline | Export-Csv -NoTypeInformation -LiteralPath "$evidence\edb-files.csv" -Encoding utf8
+    Note "Verified EDB $expected with $($baseline.Count) hashed baseline files"
 
-$secretDir = "$root\credentials"
-[void][IO.Directory]::CreateDirectory($secretDir)
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-$acl = Get-Acl -LiteralPath $secretDir
-$acl.SetAccessRuleProtection($true,$false)
-$acl.SetAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
-    $identity.User,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
-Set-Acl -LiteralPath $secretDir -AclObject $acl
-Get-ChildItem Env: | Where-Object Name -match '^PG' | ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
-$env:PGROOT = $pg
-$env:PGHOST = '127.0.0.1'
-$env:PGPORT = "$port"
-$env:PGUSER = $role
-$env:PGCONNECT_TIMEOUT = '6'
-$env:PGCLIENTENCODING = 'UTF8'
-$env:PGSYSCONFDIR = $secretDir
-$initial = @(Get-NetTCPConnection -State Listen | Where-Object LocalPort -eq $port)
-if ($initial.Count) { throw "Port $port already occupied" }
+    $x86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+    $vswhere = "$x86\Microsoft Visual Studio\Installer\vswhere.exe"
+    $vsJson = @(Run $vswhere @('-products','*','-version','[17.0,18.0)','-requires',
+        'Microsoft.VisualStudio.Component.VC.Tools.x86.x64','-latest','-format','json'))
+    $vs = @(($vsJson -join [Environment]::NewLine) | ConvertFrom-Json)
+    if ($vs.Count -ne 1 -or -not $vs[0].installationPath) { throw 'VS 2022 C++ x64 required' }
+    $batch = Join-Path $vs[0].installationPath 'VC\Auxiliary\Build\vcvars64.bat'
+    $vars = @(& $env:ComSpec /d /c ('call "{0}" >nul && set' -f $batch))
+    if ($LASTEXITCODE -ne 0) { throw 'vcvars64 failed' }
+    foreach ($line in $vars) {
+        if ($line -match '^(Path|INCLUDE|LIB|LIBPATH|WindowsSDKVersion|WindowsSdkDir|UniversalCRTSdkDir|UCRTVersion|VCINSTALLDIR|VCToolsInstallDir|VCToolsVersion|VisualStudioVersion|VSCMD_ARG_TGT_ARCH|VSCMD_ARG_HOST_ARCH)=(.*)$') {
+            [Environment]::SetEnvironmentVariable($Matches[1],$Matches[2],'Process')
+        }
+    }
+    if ($env:VSCMD_ARG_TGT_ARCH -ne 'x64' -or -not $env:WindowsSDKVersion) { throw 'Wrong MSVC target or SDK' }
+    $cl = (Get-Command cl.exe -CommandType Application -TotalCount 1).Source
+    $nmake = (Get-Command nmake.exe -CommandType Application -TotalCount 1).Source
+    $dumpbin = (Get-Command dumpbin.exe -CommandType Application -TotalCount 1).Source
+    $probe = "$root\probe.c"
+    Set-Content -LiteralPath $probe -Value 'int main(void) { return 0; }' -Encoding ascii
+    $compilerBanner = @(Run $cl @('/nologo','/Bv','/c',$probe,"/Fo$root\probe.obj"))
+    $null = Run $nmake @('/?')
+    $toolchain = [ordered]@{
+        VSInstallationVersion=$vs[0].installationVersion; VSProduct=$vs[0].displayName
+        MSVC=(Get-Item -LiteralPath $cl).VersionInfo.FileVersion; VCTools=$env:VCToolsVersion
+        WindowsSDK=$env:WindowsSDKVersion.TrimEnd('\'); NMake=(Get-Item -LiteralPath $nmake).VersionInfo.FileVersion
+        Target=$env:VSCMD_ARG_TGT_ARCH; CompilerBanner=@($compilerBanner | ForEach-Object { [string]$_ })
+    }
+    $toolchain | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath "$evidence\toolchain.json" -Encoding utf8
+    $libHeaders = @(& $dumpbin /headers "$pg\lib\postgres.lib" | Select-String -Pattern '(?i)8664|machine.*(x86|ARM64)' | ForEach-Object Line | Sort-Object -Unique)
+    if ($LASTEXITCODE -ne 0 -or -not ($libHeaders -match '(?i)8664') -or ($libHeaders -match '(?i)machine.*\((x86|ARM64)\)')) {
+        throw 'EDB postgres.lib does not match x64'
+    }
+    $libHeaders | Set-Content -LiteralPath "$evidence\postgres-lib-architecture.txt" -Encoding utf8
+
+    [void][IO.Directory]::CreateDirectory($src)
+    $git = (Get-Command git.exe -CommandType Application -TotalCount 1).Source
+    $env:GIT_TERMINAL_PROMPT = '0'
+    $null = Run $git @('-C',$src,'init')
+    $null = Run $git @('-C',$src,'-c','credential.helper=','fetch','--no-tags','--depth=1',
+        'https://github.com/pgvector/pgvector.git',$commit)
+    $null = Run $git @('-C',$src,'checkout','--detach','FETCH_HEAD')
+    $head = @(Run $git @('-C',$src,'rev-parse','HEAD'))
+    $dirty = @(Run $git @('-C',$src,'status','--porcelain'))
+    if (($head -join '') -cne $commit -or $dirty.Count -or
+        -not (Select-String -LiteralPath "$src\Makefile.win" -Pattern '^EXTVERSION\s*=\s*0\.8\.7\s*$') -or
+        -not (Select-String -LiteralPath "$src\vector.control" -Pattern "^default_version\s*=\s*'0\.8\.7'\s*$")) {
+        throw 'Pinned source or version verification failed'
+    }
+    $env:PGROOT = $pg
+    Push-Location -LiteralPath $src
+    try {
+        $null = Run $nmake @('/NOLOGO','/F','Makefile.win')
+        foreach ($f in @('vector.dll','vector.lib','vector.exp','sql\vector--0.8.7.sql')) {
+            if (-not (Test-Path -LiteralPath "$src\$f" -PathType Leaf)) { throw "Missing output: $f" }
+        }
+        Assert-X64 "$src\vector.dll"
+        $null = Run $nmake @('/NOLOGO','/F','Makefile.win','install')
+    } finally { Pop-Location }
+    if ((Hash "$src\vector.dll") -cne (Hash "$pg\lib\vector.dll")) { throw 'Installed DLL differs from build' }
+    $null = Run $dumpbin @('/dependents',"$pg\lib\vector.dll")
+    return $toolchain
+}
+
+function Initialize-LabEnvironment {
+    [void][IO.Directory]::CreateDirectory($secretDir)
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $acl = Get-Acl -LiteralPath $secretDir
+    $acl.SetAccessRuleProtection($true,$false)
+    $acl.SetAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+        $identity.User,'FullControl','ContainerInherit,ObjectInherit','None','Allow'))
+    Set-Acl -LiteralPath $secretDir -AclObject $acl
+    Get-ChildItem Env: | Where-Object Name -match '^PG' | ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
+    $env:PGROOT = $pg
+    $env:PGHOST = '127.0.0.1'
+    $env:PGPORT = "$port"
+    $env:PGUSER = $role
+    $env:PGCONNECT_TIMEOUT = '6'
+    $env:PGCLIENTENCODING = 'UTF8'
+    $env:PGSYSCONFDIR = $secretDir
+    $initial = @(Get-NetTCPConnection -State Listen | Where-Object LocalPort -eq $port)
+    if ($initial.Count) { throw "Port $port already occupied" }
+}
 
 function Lab-Pid([string]$Label) {
     $dir = "$root\$Label"
@@ -252,23 +265,144 @@ function Test-Vectors([bool]$Seed, [string]$Stage) {
     return ($rows -join [Environment]::NewLine)
 }
 
-$backup = "$root\vector-lab.dump"
-$regression = 'NOT TESTED'
-try {
-    Start-Lab 'source'
-    if (Test-Path -LiteralPath $regressExe) {
-        $priorPath = $env:Path
-        $env:Path = "$pg\bin;C:\Program Files\Git\usr\bin;$priorPath"
-        Push-Location -LiteralPath $src
+function Invoke-RegressionCase([string]$Case, [int]$TimeoutSeconds) {
+    $work = "$root\regression-work\$Case"
+    $logs = "$evidence\$Case"
+    [void][IO.Directory]::CreateDirectory($work)
+    [void][IO.Directory]::CreateDirectory($logs)
+    $argv = @("--bindir=$pg\bin", "--inputdir=$src\test", '--outputdir=.',
+        '--host=127.0.0.1', "--port=$port", "--user=$role", "--dbname=reg_$Case",
+        '--load-extension=vector', $Case)
+    Note "START $Case (${TimeoutSeconds}s limit)"
+    Note "> $regressExe $($argv -join ' ')"
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo.FileName = $regressExe
+    $process.StartInfo.WorkingDirectory = $work
+    $process.StartInfo.UseShellExecute = $false
+    $process.StartInfo.CreateNoWindow = $true
+    $process.StartInfo.RedirectStandardInput = $true
+    $process.StartInfo.RedirectStandardOutput = $true
+    $process.StartInfo.RedirectStandardError = $true
+    foreach ($arg in $argv) { $process.StartInfo.ArgumentList.Add($arg) }
+
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $timedOut = $false
+    $exitCode = $null
+    $started = $false
+    try {
+        $started = $process.Start()
+        if (-not $started) { throw 'Could not start pg_regress' }
+        $process.StandardInput.Close()
+        $streams = @($process.StandardOutput, $process.StandardError)
+        $names = @('stdout', 'stderr')
+        $pending = @($streams[0].ReadLineAsync(), $streams[1].ReadLineAsync())
+        do {
+            for ($i = 0; $i -lt $streams.Count; $i++) {
+                while ($null -ne $pending[$i] -and $pending[$i].IsCompleted) {
+                    $line = $pending[$i].GetAwaiter().GetResult()
+                    if ($null -eq $line) {
+                        $pending[$i] = $null
+                        break
+                    }
+                    Add-Content -LiteralPath "$logs\$($names[$i]).log" -Value $line -Encoding utf8
+                    Write-Host "[$Case/$($names[$i])] $line"
+                    $pending[$i] = $streams[$i].ReadLineAsync()
+                }
+            }
+            if ($process.HasExited -and $null -eq $pending[0] -and $null -eq $pending[1]) { break }
+            if (-not $timedOut -and $clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                $timedOut = $true
+                Note "Deadline reached for $Case. Stopping its process tree."
+                if (-not $process.HasExited) { $process.Kill($true) }
+            }
+            Start-Sleep -Milliseconds 50
+        } while ($clock.Elapsed.TotalSeconds -lt ($TimeoutSeconds + 5))
+        if ($process.HasExited) { $exitCode = $process.ExitCode }
+    } catch {
+        Note "Harness error for ${Case}: $($_.Exception.Message)"
+    } finally {
         try {
-            $result = @(Run $nmake @('/NOLOGO','/F','Makefile.win','installcheck'))
-            if (-not ($result -match 'All 14 tests passed')) { throw 'Upstream regression summary mismatch' }
-            $regression = 'PASS (14/14)'
-        } finally {
-            Pop-Location
+            if ($started -and -not $process.HasExited) {
+                $process.Kill($true)
+                if (-not $process.WaitForExit(5000)) { throw "Could not stop pg_regress for $Case" }
+            }
+        } finally { $process.Dispose() }
+    }
+
+    foreach ($relative in @('regression.out', 'regression.diffs', "results\$Case.out")) {
+        $file = Join-Path $work $relative
+        if (Test-Path -LiteralPath $file -PathType Leaf) { Copy-Item -LiteralPath $file -Destination $logs }
+    }
+    $status = 'FAIL'
+    if ($timedOut) { $status = 'TIMEOUT' }
+    elseif ($exitCode -eq 0 -and (Test-Path -LiteralPath "$logs\regression.out" -PathType Leaf) -and
+        (Test-Path -LiteralPath "$logs\$Case.out" -PathType Leaf) -and
+        (Select-String -LiteralPath "$logs\regression.out" -Pattern '^ok\s+1\s')) { $status = 'PASS' }
+    $seconds = [Math]::Round($clock.Elapsed.TotalSeconds, 2)
+    Note "END $Case status=$status seconds=$seconds exit=$exitCode"
+    [pscustomobject]@{ Case=$Case; Status=$status; Seconds=$seconds; ExitCode=$exitCode }
+}
+
+function Invoke-UpstreamRegression {
+    $cases = @('bit','btree','cast','copy','halfvec','hnsw_bit','hnsw_halfvec','hnsw_sparsevec','hnsw_vector',
+        'ivfflat_bit','ivfflat_halfvec','ivfflat_vector','sparsevec','vector_type')
+    $table = @($cases | ForEach-Object { [pscustomobject]@{ Case=$_; Status='NOT RUN'; Seconds=$null; ExitCode=$null } })
+    $resultsPath = "$evidence\results.csv"
+    $table | Export-Csv -NoTypeInformation -LiteralPath $resultsPath -Encoding utf8
+    $priorPath = $env:Path
+    try {
+        Note 'Running the pinned upstream Windows regression list, one fresh database per case.'
+        $manifest = Get-Content -Raw -LiteralPath "$upload\build-manifest.json" | ConvertFrom-Json
+        $dll = @($manifest.files | Where-Object Path -CEQ 'lib/vector.dll')
+        if ($manifest.coreTests -cne 'PASS' -or $manifest.workflowRunId -cne $env:GITHUB_RUN_ID -or
+            $manifest.workflowCommit -cne $env:GITHUB_SHA -or $dll.Count -ne 1 -or
+            (Hash "$pg\lib\vector.dll") -cne $dll[0].SHA256) { throw 'Core build identity mismatch' }
+        Assert-X64 $regressExe
+        $git = (Get-Command git.exe -CommandType Application -TotalCount 1).Source
+        $diffDir = Join-Path (Split-Path -Parent (Split-Path -Parent $git)) 'usr\bin'
+        if (-not (Test-Path -LiteralPath "$diffDir\diff.exe" -PathType Leaf)) { throw 'Git for Windows diff.exe missing' }
+        $env:Path = "$pg\bin;$diffDir;$priorPath"
+        $head = @(Run $git @('-C',$src,'rev-parse','HEAD'))
+        $schedule = Select-String -LiteralPath "$src\Makefile.win" -Pattern '^REGRESS\s*=\s*(.+)$'
+        if (($head -join '') -cne $commit -or $schedule.Matches[0].Groups[1].Value.Trim() -cne ($cases -join ' ')) {
+            throw 'Pinned upstream regression list does not match'
+        }
+
+        Initialize-LabEnvironment
+        Start-Lab 'regression'
+        for ($i = 0; $i -lt $cases.Count; $i++) {
+            $table[$i] = Invoke-RegressionCase $cases[$i] 45
+            $table | Export-Csv -NoTypeInformation -LiteralPath $resultsPath -Encoding utf8
+        }
+    } finally {
+        try { Stop-Lab 'regression' }
+        finally {
             $env:Path = $priorPath
+            $passed = @($table | Where-Object Status -EQ 'PASS').Count
+            $failed = @($table | Where-Object Status -EQ 'FAIL').Count
+            $timeouts = @($table | Where-Object Status -EQ 'TIMEOUT').Count
+            $notRun = @($table | Where-Object Status -EQ 'NOT RUN').Count
+            $summary = "Upstream regression: $passed/$($cases.Count) PASS, $failed FAIL, $timeouts TIMEOUT, $notRun NOT RUN."
+            Note $summary
+            Set-Content -LiteralPath "$evidence\SUMMARY.txt" -Value $summary -Encoding utf8
+            if ($env:GITHUB_STEP_SUMMARY) { Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value $summary -Encoding utf8 }
         }
     }
+    if ($passed -ne $cases.Count) { throw $summary }
+    if (Get-NetTCPConnection -State Listen | Where-Object LocalPort -eq $port) { throw 'Regression port still occupied' }
+}
+
+if ($Phase -eq 'Regression') {
+    Invoke-UpstreamRegression
+    return
+}
+
+$toolchain = Build-Extension
+Initialize-LabEnvironment
+$backup = "$root\vector-lab.dump"
+try {
+    Start-Lab 'source'
     $null = Run "$pg\bin\createdb.exe" ($conn + @('--template=template0',$db))
     $source = Test-Vectors $true '01-source'
     $null = Run "$pg\bin\pg_dump.exe" ($conn + @('-d',$db,'-Fc','-f',$backup))
@@ -297,16 +431,12 @@ foreach ($label in @('source','restore')) {
 if (Get-NetTCPConnection -State Listen | Where-Object LocalPort -eq $port) { throw 'Lab port still occupied' }
 Note 'PASS both local-only runner clusters stopped'
 
-$upload = "$root\upload"
 $payload = "$root\$bundle"
 [void][IO.Directory]::CreateDirectory($upload)
 [void][IO.Directory]::CreateDirectory($payload)
 $extensions = @('lib/vector.dll','share/extension/vector.control') +
     @(Get-ChildItem -LiteralPath "$pg\share\extension" -Filter 'vector--*.sql' -File | ForEach-Object { "share/extension/$($_.Name)" })
-$include = "$pg\include\server\extension\vector"
-if (Test-Path -LiteralPath $include) {
-    $extensions += @(Get-ChildItem -LiteralPath $include -Filter '*.h' -File | ForEach-Object { "include/server/extension/vector/$($_.Name)" })
-}
+$extensions += 'halfvec.h','sparsevec.h','vector.h' | ForEach-Object { "include/server/extension/vector/$_" }
 foreach ($f in $extensions) {
     $dest = Join-Path $payload $f
     [void][IO.Directory]::CreateDirectory((Split-Path -Parent $dest))
@@ -323,8 +453,8 @@ $meta = [ordered]@{
     runnerLabel='windows-2022'; runnerArch=$env:RUNNER_ARCH; runnerImageOS=$env:ImageOS
     runnerImageVersion=$env:ImageVersion; windowsVersion=$os.Version; windowsBuild=$os.BuildNumber
     toolchain=$toolchain
-    buildCommands=@('nmake /NOLOGO /F Makefile.win','nmake /NOLOGO /F Makefile.win install','nmake /NOLOGO /F Makefile.win installcheck')
-    tests='PASS'; upstreamRegression=$regression; seedRows=10004; nonNullVectors=10003; testsPort=$port
+    buildCommands=@('nmake /NOLOGO /F Makefile.win','nmake /NOLOGO /F Makefile.win install')
+    coreTests='PASS'; upstreamRegression='NOT RUN at packaging time'; seedRows=10004; nonNullVectors=10003; testsPort=$port
     dateUtc=[DateTime]::UtcNow.ToString('o'); workflowRunId=$env:GITHUB_RUN_ID; workflowCommit=$env:GITHUB_SHA
     runAttempt=$env:GITHUB_RUN_ATTEMPT; workflowRunUrl="$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
     baselineManifestSHA256=(Hash "$evidence\edb-files.csv"); testResultSHA256=(Hash "$evidence\01-source.txt")
@@ -337,7 +467,7 @@ $meta | ConvertTo-Json -Depth 7 | Set-Content -LiteralPath "$payload\build-manif
     "Runner: windows-2022 X64 / $($meta.runnerImageVersion) / $($meta.windowsVersion)",
     "MSVC $($toolchain.MSVC) / NMAKE $($toolchain.NMake) / SDK $($toolchain.WindowsSDK)",
     "Source $commit", "EDB SHA-256 $expected", "vector.dll SHA-256 $(Hash "$pg\lib\vector.dll")",
-    "Upstream regression $regression",
+    'Upstream regression had not run at packaging time. See the separate regression evidence artifact.',
     'Functional tests, three exact/HNSW comparisons, independent restore, and source recheck passed.'
 ) | Set-Content -LiteralPath "$payload\BUILD-REPORT.md" -Encoding utf8
 $sums = foreach ($relative in (@($files.Path) + @('build-manifest.json','BUILD-REPORT.md'))) {
